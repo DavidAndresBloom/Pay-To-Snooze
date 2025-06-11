@@ -1,1 +1,669 @@
+import SwiftUI
+import AlarmKit
+import StoreKit
+import ActivityKit
+import CoreMotion
 
+@main
+struct PayToSnoozeApp: App {
+    @StateObject private var alarmManager = AlarmManager()
+    @Environment(\.scenePhase) var scenePhase
+    
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+                .environmentObject(alarmManager)
+                .onAppear {
+                    alarmManager.requestAuthorization()
+                }
+                .onChange(of: scenePhase) { newPhase in
+                    switch newPhase {
+                    case .background:
+                        if alarmManager.isAlarmActive {
+                            print("App backgrounded with active alarm")
+                            alarmManager.scheduleBackgroundAlarm()
+                        }
+                    case .inactive:
+                        if alarmManager.isAlarmActive && alarmManager.hasPendingSnoozeCharge {
+                            print("App becoming inactive with pending charge")
+                        }
+                    case .active:
+                        // Cancel any background alarms when returning
+                        alarmManager.cancelBackgroundAlarms()
+                    @unknown default:
+                        break
+                    }
+                }
+        }
+    }
+}
+
+// AlarmKit Attributes for Live Activity
+struct AlarmAttributes: ActivityAttributes {
+    public typealias AlarmStatus = ContentState
+    
+    public struct ContentState: Codable, Hashable {
+        var alarmTime: Date
+        var isPaused: Bool
+        var snoozeCount: Int
+    }
+    
+    var alarmID: String
+}
+
+class AlarmManager: ObservableObject {
+    @Published var todaySnoozeCount = 0
+    @Published var todaySpent: Double = 0.0
+    @Published var hasPendingSnoozeCharge = false
+    @Published var isAlarmActive = false
+    @Published var authorizationStatus = AlarmManager.shared.authorizationState
+    
+    private var currentAlarmID: String?
+    private let motionManager = CMMotionActivityManager()
+    private var motionTimer: Timer?
+    
+    init() {
+        loadTodaysTally()
+        checkForPendingCharges()
+        setupAlarmHandlers()
+    }
+    
+    func requestAuthorization() {
+        Task {
+            do {
+                try await AlarmManager.shared.requestAuthorization()
+                await MainActor.run {
+                    authorizationStatus = AlarmManager.shared.authorizationState
+                }
+            } catch {
+                print("Authorization failed: \(error)")
+            }
+        }
+    }
+    
+    func setupAlarmHandlers() {
+        // Listen for alarm events
+        Task {
+            for await event in AlarmManager.shared.alarmEvents {
+                await handleAlarmEvent(event)
+            }
+        }
+        
+        // Listen for app lifecycle events
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appWillTerminate),
+            name: UIApplication.willTerminateNotification,
+            object: nil
+        )
+        
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appDidEnterBackground),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
+    }
+    
+    @MainActor
+    func handleAlarmEvent(_ event: AlarmEvent) async {
+        switch event {
+        case .didSnooze(let alarmID):
+            print("Snooze detected for alarm \(alarmID)")
+            isAlarmActive = false
+            hasPendingSnoozeCharge = true
+            UserDefaults.standard.set(true, forKey: "hasPendingSnoozeCharge")
+            await chargeUser(for: alarmID)
+            
+        case .didStop(let alarmID):
+            print("Alarm stopped: \(alarmID)")
+            isAlarmActive = false
+            startMotionMonitoring(for: alarmID)
+            
+        case .didStart(let alarmID):
+            print("Alarm started: \(alarmID)")
+            isAlarmActive = true
+            currentAlarmID = alarmID
+            
+        default:
+            break
+        }
+    }
+    
+    func scheduleAlarm(at date: Date) {
+        guard authorizationStatus == .authorized else {
+            print("Not authorized to set alarms")
+            return
+        }
+        
+        let alarmID = UUID().uuidString
+        currentAlarmID = alarmID
+        
+        // Create alarm configuration
+        let schedule = Alarm.Schedule.fixed(date)
+        
+        // Configure alert appearance
+        let alertPresentation = createAlertPresentation()
+        
+        // Configure Live Activity
+        let activityConfiguration = createActivityConfiguration()
+        
+        let configuration = Alarm.Configuration(
+            schedule: schedule,
+            alertPresentation: alertPresentation,
+            activityConfiguration: activityConfiguration,
+            metadata: nil
+        )
+        
+        // Schedule with AlarmManager
+        Task {
+            do {
+                try await AlarmManager.shared.schedule(alarmID, configuration: configuration)
+                print("Alarm scheduled for \(date)")
+            } catch {
+                print("Failed to schedule alarm: \(error)")
+            }
+        }
+    }
+    
+    func createAlertPresentation() -> Alarm.AlertPresentation {
+        // Custom snooze button that costs $0.99
+        let snoozeButton = AlarmButton(
+            title: "Snooze ($0.99)",
+            color: .orange,
+            icon: "zzz"
+        )
+        
+        // Stop button
+        let stopButton = AlarmButton(
+            title: "Stop",
+            color: .red,
+            icon: "stop.circle"
+        )
+        
+        // Custom sound (add alarm-sound.mp3 to your bundle)
+        let sound = AlertSound(named: "alarm-sound", volume: 1.0)
+        
+        return Alarm.AlertPresentation(
+            title: "Pay-to-Snooze",
+            body: "Time to wake up! Snoozing costs $0.99",
+            sound: sound,
+            primaryButton: stopButton,
+            secondaryButton: snoozeButton,
+            secondaryButtonBehavior: .custom, // This triggers our handler
+            priority: .critical, // Makes it harder to dismiss
+            interruptionLevel: .critical // Breaks through Focus modes
+        )
+    }
+    
+    @objc func appWillTerminate() {
+        if isAlarmActive || hasPendingSnoozeCharge {
+            // Schedule an immediate critical alarm
+            scheduleAntiCheatAlarm()
+        }
+    }
+    
+    @objc func appDidEnterBackground() {
+        if isAlarmActive {
+            // Keep alarm active in background
+            scheduleBackgroundAlarm()
+        }
+    }
+    
+    func scheduleAntiCheatAlarm() {
+        let alarmID = "anticheat-\(UUID().uuidString)"
+        
+        // Schedule for 1 second from now
+        let schedule = Alarm.Schedule.fixed(Date().addingTimeInterval(1))
+        
+        // Create a more aggressive alert
+        let alertPresentation = Alarm.AlertPresentation(
+            title: "Nice try! 🚨",
+            body: "App closure detected! You still owe $\(todaySpent + 0.99). The alarm will keep going until you pay!",
+            sound: AlertSound(named: "alarm-sound", volume: 1.0),
+            primaryButton: AlarmButton(title: "PAY NOW", color: .red, icon: "dollarsign.circle"),
+            secondaryButton: nil,
+            secondaryButtonBehavior: .none,
+            priority: .critical,
+            interruptionLevel: .critical,
+            suppressDismissal: true // New in iOS 26 - makes it harder to dismiss
+        )
+        
+        let configuration = Alarm.Configuration(
+            schedule: schedule,
+            alertPresentation: alertPresentation,
+            activityConfiguration: nil,
+            metadata: ["type": "anticheat", "amount": todaySpent + 0.99]
+        )
+        
+        Task {
+            do {
+                try await AlarmManager.shared.schedule(alarmID, configuration: configuration)
+                
+                // Also schedule follow-up alarms
+                for i in 1...5 {
+                    let followUpID = "followup-\(i)-\(UUID().uuidString)"
+                    let followUpSchedule = Alarm.Schedule.fixed(Date().addingTimeInterval(Double(i * 30)))
+                    
+                    var followUpConfig = configuration
+                    followUpConfig.schedule = followUpSchedule
+                    followUpConfig.alertPresentation = alertPresentation.with(
+                        title: "Still avoiding payment? 💸",
+                        body: "Alarm #\(i+1) - You owe $\(todaySpent + 0.99)!"
+                    )
+                    
+                    try await AlarmManager.shared.schedule(followUpID, configuration: followUpConfig)
+                }
+            } catch {
+                print("Failed to schedule anti-cheat alarm: \(error)")
+            }
+        }
+    }
+    
+    func scheduleBackgroundAlarm() {
+        // Use AlarmKit's background alarm capability
+        let backgroundID = "background-\(UUID().uuidString)"
+        
+        let configuration = Alarm.Configuration(
+            schedule: .relative(Alarm.Schedule.Relative(
+                time: Alarm.Schedule.Relative.Time(hour: 0, minute: 0),
+                repeats: .minutely // Alarm every minute while in background
+            )),
+            alertPresentation: createAlertPresentation().with(
+                body: "Return to Pay-to-Snooze to stop this alarm!"
+            ),
+            activityConfiguration: nil,
+            metadata: ["type": "background"],
+            options: [.allowsBackgroundExecution, .criticalAlert]
+        )
+        
+        Task {
+            do {
+                try await AlarmManager.shared.schedule(backgroundID, configuration: configuration)
+            } catch {
+                print("Failed to schedule background alarm: \(error)")
+            }
+        }
+    }
+    
+    func createActivityConfiguration() -> Alarm.ActivityConfiguration {
+        let attributes = AlarmAttributes(alarmID: currentAlarmID ?? "")
+        let contentState = AlarmAttributes.ContentState(
+            alarmTime: Date(),
+            isPaused: false,
+            snoozeCount: todaySnoozeCount
+        )
+        
+        return Alarm.ActivityConfiguration(
+            attributes: attributes,
+            contentState: contentState
+        )
+    }
+    
+    func chargeUser(for alarmID: String) async {
+        do {
+            let products = try await Product.products(for: ["snooze_token"])
+            
+            guard let snoozeProduct = products.first else {
+                print("Snooze token product not found")
+                // Prevent snooze without payment
+                await preventSnooze(for: alarmID)
+                return
+            }
+            
+            let result = try await snoozeProduct.purchase()
+            
+            switch result {
+            case .success(let verification):
+                switch verification {
+                case .verified(let transaction):
+                    await transaction.finish()
+                    print("Successfully charged $0.99 for snooze")
+                    
+                    await MainActor.run {
+                        incrementTally()
+                        hasPendingSnoozeCharge = false
+                        UserDefaults.standard.set(false, forKey: "hasPendingSnoozeCharge")
+                    }
+                    
+                    // Allow the snooze to proceed
+                    await allowSnooze(for: alarmID)
+                    
+                case .unverified(_, _):
+                    print("Transaction verification failed")
+                    await preventSnooze(for: alarmID)
+                }
+                
+            case .userCancelled:
+                print("User cancelled - preventing snooze")
+                await preventSnooze(for: alarmID)
+                
+            case .pending:
+                print("Transaction pending - preventing snooze")
+                await preventSnooze(for: alarmID)
+                
+            @unknown default:
+                await preventSnooze(for: alarmID)
+            }
+            
+        } catch {
+            print("Purchase failed: \(error)")
+            await preventSnooze(for: alarmID)
+        }
+    }
+    
+    func allowSnooze(for alarmID: String) async {
+        do {
+            // Transition to snooze state (9 minutes by default)
+            try await AlarmManager.shared.snooze(alarmID)
+        } catch {
+            print("Failed to snooze: \(error)")
+        }
+    }
+    
+    func preventSnooze(for alarmID: String) async {
+        do {
+            // Resume the alarm immediately
+            try await AlarmManager.shared.resume(alarmID)
+            await MainActor.run {
+                isAlarmActive = true
+            }
+        } catch {
+            print("Failed to prevent snooze: \(error)")
+        }
+    }
+    
+    func cancelAlarm() {
+        guard let alarmID = currentAlarmID else { return }
+        
+        Task {
+            do {
+                try await AlarmManager.shared.cancel(alarmID)
+                await MainActor.run {
+                    isAlarmActive = false
+                    currentAlarmID = nil
+                }
+            } catch {
+                print("Failed to cancel alarm: \(error)")
+            }
+        }
+    }
+    
+    func startMotionMonitoring(for alarmID: String) {
+        guard CMMotionActivityManager.isActivityAvailable() else { return }
+        
+        var isMoving = false
+        
+        // Monitor for 5 minutes
+        motionTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: false) { [weak self] _ in
+            if !isMoving {
+                Task {
+                    await self?.reactivateAlarm(alarmID)
+                }
+            }
+        }
+        
+        motionManager.startActivityUpdates(to: .main) { activity in
+            if let activity = activity {
+                if activity.walking || activity.running || activity.cycling {
+                    isMoving = true
+                    self.motionTimer?.invalidate()
+                    self.motionManager.stopActivityUpdates()
+                }
+            }
+        }
+    }
+    
+    func reactivateAlarm(_ alarmID: String) async {
+        print("No motion detected - reactivating alarm!")
+        
+        // Create a new alarm that goes off immediately
+        let immediateAlarm = UUID().uuidString
+        let schedule = Alarm.Schedule.fixed(Date())
+        let alertPresentation = createAlertPresentation()
+        
+        let configuration = Alarm.Configuration(
+            schedule: schedule,
+            alertPresentation: alertPresentation.with(
+                title: "Nice try! 😏",
+                body: "We noticed you're not actually awake. Pay up or wake up!"
+            ),
+            activityConfiguration: nil,
+            metadata: nil
+        )
+        
+        do {
+            try await AlarmManager.shared.schedule(immediateAlarm, configuration: configuration)
+            await MainActor.run {
+                isAlarmActive = true
+                currentAlarmID = immediateAlarm
+            }
+        } catch {
+            print("Failed to reactivate alarm: \(error)")
+        }
+    }
+    
+    func loadTodaysTally() {
+        let today = Calendar.current.startOfDay(for: Date())
+        let lastResetDate = UserDefaults.standard.object(forKey: "lastTallyReset") as? Date ?? Date.distantPast
+        
+        if !Calendar.current.isDate(lastResetDate, inSameDayAs: today) {
+            UserDefaults.standard.set(0, forKey: "todaySnoozeCount")
+            UserDefaults.standard.set(today, forKey: "lastTallyReset")
+            todaySnoozeCount = 0
+            todaySpent = 0.0
+        } else {
+            todaySnoozeCount = UserDefaults.standard.integer(forKey: "todaySnoozeCount")
+            todaySpent = Double(todaySnoozeCount) * 0.99
+        }
+    }
+    
+    func incrementTally() {
+        todaySnoozeCount += 1
+        todaySpent = Double(todaySnoozeCount) * 0.99
+        UserDefaults.standard.set(todaySnoozeCount, forKey: "todaySnoozeCount")
+    }
+    
+    func checkForPendingCharges() {
+        hasPendingSnoozeCharge = UserDefaults.standard.bool(forKey: "hasPendingSnoozeCharge")
+        
+        if hasPendingSnoozeCharge {
+            Task {
+                await chargeUser(for: "pending")
+            }
+        }
+    }
+    
+    func cancelBackgroundAlarms() {
+        Task {
+            do {
+                // Cancel all background alarms
+                let alarms = try await AlarmManager.shared.pendingAlarms()
+                for alarm in alarms {
+                    if let metadata = alarm.metadata as? [String: Any],
+                       let type = metadata["type"] as? String,
+                       (type == "background" || type == "anticheat" || type.starts(with: "followup")) {
+                        try await AlarmManager.shared.cancel(alarm.identifier)
+                    }
+                }
+            } catch {
+                print("Failed to cancel background alarms: \(error)")
+            }
+        }
+    }
+}
+
+struct ContentView: View {
+    @State private var alarmTime = Date()
+    @State private var isAlarmEnabled = false
+    @EnvironmentObject var alarmManager: AlarmManager
+    
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 30) {
+                Text("Pay-to-Snooze")
+                    .font(.largeTitle)
+                    .padding(.top)
+                
+                Text("Set your alarm and pay $0.99 each time you snooze!")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+                
+                // Authorization status
+                if alarmManager.authorizationStatus == .denied {
+                    HStack {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.red)
+                        Text("Please enable alarm permissions in Settings")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                    }
+                    .padding()
+                    .background(Color.red.opacity(0.1))
+                    .cornerRadius(10)
+                    .padding(.horizontal)
+                }
+                
+                // Show pending charge banner if needed
+                if alarmManager.hasPendingSnoozeCharge {
+                    HStack {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.yellow)
+                        Text("You have a pending snooze charge!")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                    }
+                    .padding()
+                    .background(Color.red.opacity(0.1))
+                    .cornerRadius(10)
+                    .padding(.horizontal)
+                }
+                
+                VStack(spacing: 20) {
+                    Text("Alarm Time")
+                        .font(.headline)
+                    
+                    DatePicker("", selection: $alarmTime, displayedComponents: .hourAndMinute)
+                        .datePickerStyle(WheelDatePickerStyle())
+                        .labelsHidden()
+                        .onChange(of: alarmTime) { newValue in
+                            if isAlarmEnabled {
+                                updateAlarm()
+                            }
+                        }
+                    
+                    HStack {
+                        Text("Alarm")
+                            .font(.title2)
+                        
+                        Spacer()
+                        
+                        Toggle("", isOn: $isAlarmEnabled)
+                            .onChange(of: isAlarmEnabled) { enabled in
+                                if enabled {
+                                    setAlarm()
+                                } else {
+                                    cancelAlarm()
+                                }
+                            }
+                            .disabled(alarmManager.authorizationStatus != .authorized)
+                    }
+                    .padding(.horizontal, 40)
+                }
+                .padding()
+                .background(Color(.systemGray6))
+                .cornerRadius(15)
+                .padding(.horizontal)
+                
+                // Show active alarm indicator
+                if alarmManager.isAlarmActive {
+                    VStack(spacing: 10) {
+                        Text("⏰ ALARM ACTIVE")
+                            .font(.headline)
+                            .foregroundColor(.red)
+                        
+                        Text("Snoozing will cost $0.99")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .padding()
+                    .background(Color.red.opacity(0.1))
+                    .cornerRadius(10)
+                    .padding(.horizontal)
+                }
+                
+                // Daily Tally Display
+                VStack(spacing: 10) {
+                    Text("Today's Tally")
+                        .font(.headline)
+                        .foregroundColor(.secondary)
+                    
+                    HStack(spacing: 30) {
+                        VStack {
+                            Text("\(alarmManager.todaySnoozeCount)")
+                                .font(.largeTitle)
+                                .fontWeight(.bold)
+                            Text("Snoozes")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        
+                        Divider()
+                            .frame(height: 40)
+                        
+                        VStack {
+                            Text("$\(alarmManager.todaySpent, specifier: "%.2f")")
+                                .font(.largeTitle)
+                                .fontWeight(.bold)
+                                .foregroundColor(.green)
+                            Text("Spent")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+                .padding()
+                .background(Color(.systemGray6))
+                .cornerRadius(15)
+                .padding(.horizontal)
+                
+                Spacer()
+            }
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+    
+    func setAlarm() {
+        alarmManager.scheduleAlarm(at: alarmTime)
+    }
+    
+    func updateAlarm() {
+        alarmManager.cancelAlarm()
+        alarmManager.scheduleAlarm(at: alarmTime)
+    }
+    
+    func cancelAlarm() {
+        alarmManager.cancelAlarm()
+    }
+}
+
+// Extension to modify AlertPresentation
+extension Alarm.AlertPresentation {
+    func with(title: String? = nil, body: String? = nil) -> Alarm.AlertPresentation {
+        return Alarm.AlertPresentation(
+            title: title ?? self.title,
+            body: body ?? self.body,
+            sound: self.sound,
+            primaryButton: self.primaryButton,
+            secondaryButton: self.secondaryButton,
+            secondaryButtonBehavior: self.secondaryButtonBehavior
+        )
+    }
+}
+
+#Preview {
+    ContentView()
+        .environmentObject(AlarmManager())
+}
